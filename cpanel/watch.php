@@ -24,11 +24,18 @@ $cfg += [
     // الأسماء الظاهرة في الرسائل
     'asset_label' => 'الدولار',
     'currency_label' => 'جنيه',
-    // توقيع القناة أسفل كل رسالة (null = يؤخذ من chat_id إذا كان @username، '' = بدون توقيع)
-    'channel_tag' => null,
+    // اسم القناة وشعارها: يظهران في توقيع كل رسالة وفي نص المشاركة
+    'brand_name' => 'سيركل زون',
+    'tagline' => 'تنبيهات سعر الدولار لحظة بلحظة',
+    // رابط القناة (null = يؤخذ من chat_id إذا كان @username، '' = بدون رابط ولا أزرار)
+    'channel_link' => null,
+    // أزرار "شارك" أسفل الرسائل
+    'share_buttons' => true,
 ];
-if ($cfg['channel_tag'] === null) {
-    $cfg['channel_tag'] = strpos((string)$cfg['chat_id'], '@') === 0 ? $cfg['chat_id'] : '';
+if ($cfg['channel_link'] === null) {
+    $cfg['channel_link'] = strpos((string)$cfg['chat_id'], '@') === 0
+        ? 'https://t.me/' . substr($cfg['chat_id'], 1)
+        : '';
 }
 date_default_timezone_set($cfg['timezone']);
 
@@ -121,20 +128,33 @@ function fetch_price(array $cfg, string $tradeType): float
     return $n % 2 ? $prices[$mid] : ($prices[$mid - 1] + $prices[$mid]) / 2;
 }
 
-function send_telegram(array $cfg, string $text): bool
+/** $buttons: صف أزرار روابط [['text' => ..., 'url' => ...], ...] */
+function send_telegram(array $cfg, string $text, array $buttons = []): bool
 {
-    try {
-        http_post_json("https://api.telegram.org/bot{$cfg['bot_token']}/sendMessage", [
-            'chat_id' => $cfg['chat_id'],
-            'text' => $text,
-            'parse_mode' => 'HTML',
-            'disable_web_page_preview' => true,
-        ]);
-        return true;
-    } catch (Throwable $e) {
-        fwrite(STDERR, 'فشل الإرسال لتلجرام: ' . $e->getMessage() . "\n");
-        return false;
+    $url = "https://api.telegram.org/bot{$cfg['bot_token']}/sendMessage";
+    $payload = [
+        'chat_id' => $cfg['chat_id'],
+        'text' => $text,
+        'parse_mode' => 'HTML',
+        'disable_web_page_preview' => true,
+    ];
+    $attempts = $buttons
+        ? [$payload + ['reply_markup' => ['inline_keyboard' => [$buttons]]], $payload]
+        : [$payload];
+
+    foreach ($attempts as $i => $body) {
+        try {
+            http_post_json($url, $body);
+            return true;
+        } catch (Throwable $e) {
+            fwrite(STDERR, 'فشل الإرسال لتلجرام: ' . $e->getMessage() . "\n");
+            // الأزرار اختيارية: لو رفضها تلجرام (400) نعيد الإرسال بدونها حتى لا يضيع التنبيه
+            if (strpos($e->getMessage(), 'HTTP 400') !== 0) {
+                return false;
+            }
+        }
     }
+    return false;
 }
 
 function pct(float $cur, float $ref): float
@@ -149,25 +169,39 @@ function fmt(float $v): string
     return substr($s, -3) === '.00' ? substr($s, 0, -3) : $s;
 }
 
-/** "▲ 70 جنيه (0.65%)" */
-function move_text(array $cfg, float $cur, float $from): string
+/** "10,774 جنيه" */
+function money(array $cfg, float $v): string
 {
-    $d = $cur - $from;
-    $arrow = $d > 0 ? '🔺' : ($d < 0 ? '🔻' : '▪️');
-    return sprintf('%s %s %s (%.2f%%)', $arrow, fmt(abs($d)), $cfg['currency_label'], abs(pct($cur, $from)));
+    return fmt($v) . ' ' . $cfg['currency_label'];
+}
+
+/** "زيادة 70 جنيه (0.66%)" أو "انخفاض 70 جنيه (0.66%)" */
+function change_text(array $cfg, float $cur, float $from): string
+{
+    return ($cur >= $from ? 'زيادة ' : 'انخفاض ')
+        . money($cfg, abs($cur - $from))
+        . sprintf(' (%.2f%%)', abs(pct($cur, $from)));
+}
+
+function minutes_text(int $n): string
+{
+    if ($n === 1) {
+        return 'دقيقة';
+    }
+    if ($n === 2) {
+        return 'دقيقتين';
+    }
+    return $n <= 10 ? "$n دقائق" : "$n دقيقة";
 }
 
 /** بطاقة الأسعار؛ الرقم داخل <code> ليُنسخ بضغطة واحدة */
 function price_card(float $buy, float $sell, ?float $buyRef = null, ?float $sellRef = null): string
 {
-    $row = function (string $dot, string $label, float $cur, ?float $ref): string {
-        $line = "$dot <b>$label</b>   <code>" . fmt($cur) . '</code>';
-        if ($ref !== null) {
-            $line .= "\n       كان " . fmt($ref);
-        }
-        return $line;
+    $row = function (string $label, float $cur, ?float $ref): string {
+        return "<b>$label</b>  <code>" . fmt($cur) . '</code>'
+            . ($ref !== null ? '  (كان ' . fmt($ref) . ')' : '');
     };
-    return '<blockquote>' . $row('🟢', 'شراء', $buy, $buyRef) . "\n" . $row('🔴', 'بيع', $sell, $sellRef) . '</blockquote>';
+    return '<blockquote>' . $row('شراء', $buy, $buyRef) . "\n" . $row('بيع', $sell, $sellRef) . '</blockquote>';
 }
 
 /** حاسبة سريعة: كم يساوي 10$ و50$ و100$ بسعر الشراء الحالي */
@@ -176,16 +210,63 @@ function calc_card(array $cfg, float $buy): string
     if (!$cfg['calc_amounts']) {
         return '';
     }
-    $lines = ["🧮 <b>كم يساوي بال{$cfg['currency_label']}؟</b>"];
+    $lines = ['🧮 <b>حاسبة سريعة</b>'];
     foreach ($cfg['calc_amounts'] as $usd) {
         $lines[] = "$usd$ = " . number_format($usd * $buy) . " {$cfg['currency_label']}";
     }
     return "\n<blockquote>" . implode("\n", $lines) . '</blockquote>';
 }
 
+/**
+ * الوقت والتاريخ مكتوبان داخل الرسالة لأن الرسالة المعاد توجيهها تُظهر وقت التوجيه لا وقت السعر.
+ * اسم القناة رابط، فيبقى طريق الرجوع للقناة مع الرسالة أينما ذهبت.
+ */
 function footer(array $cfg): string
 {
-    return "\n🕒 " . date('H:i') . ($cfg['channel_tag'] !== '' ? "  •  {$cfg['channel_tag']}" : '');
+    static $months = ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو',
+        'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'];
+    $out = "\n🕒 " . date('g:i') . (date('A') === 'AM' ? ' ص' : ' م')
+        . '  •  ' . date('j') . ' ' . $months[date('n') - 1];
+
+    if ($cfg['brand_name'] !== '') {
+        $brand = '<b>' . htmlspecialchars($cfg['brand_name'], ENT_NOQUOTES) . '</b>';
+        if ($cfg['channel_link'] !== '') {
+            $brand = '<a href="' . htmlspecialchars($cfg['channel_link']) . "\">$brand</a>";
+        }
+        $out .= "\n🔔 $brand — " . htmlspecialchars($cfg['tagline'], ENT_NOQUOTES);
+    }
+    return $out;
+}
+
+/** رسالة كاملة: السطر الأول يحمل الخبر كله لأنه ما يظهر في الإشعار */
+function compose(array $cfg, string $headline, string $sub, string $cards): string
+{
+    return '<b>' . htmlspecialchars($headline, ENT_NOQUOTES) . "</b>\n"
+        . htmlspecialchars($sub, ENT_NOQUOTES) . "\n"
+        . $cards . footer($cfg);
+}
+
+/** زرّان يفتحان واتساب وتلجرام بنص جاهز فيه السعر ورابط القناة */
+function share_buttons(array $cfg, string $headline, float $buy, float $sell): array
+{
+    $link = $cfg['channel_link'];
+    if (!$cfg['share_buttons'] || $link === '') {
+        return [];
+    }
+    $prices = 'شراء ' . fmt($buy) . ' | بيع ' . fmt($sell) . ' ' . $cfg['currency_label'];
+    $brand = "🔔 {$cfg['brand_name']} — {$cfg['tagline']}";
+
+    return [
+        [
+            'text' => '📲 شارك واتساب',
+            'url' => 'https://wa.me/?text=' . rawurlencode("*$headline*\n$prices\n\n$brand\n$link"),
+        ],
+        [
+            'text' => '✈️ شارك تلجرام',
+            'url' => 'https://t.me/share/url?url=' . rawurlencode($link)
+                . '&text=' . rawurlencode("$headline\n$prices\n\n$brand"),
+        ],
+    ];
 }
 
 // ---------- الحالة ----------
@@ -251,10 +332,12 @@ if ($testMode) {
 
 // أول تشغيل: نثبت السعر المرجعي ونرسل رسالة بداية
 if ($state['buy_ref'] === null || $state['sell_ref'] === null) {
-    $msg = "🤖 <b>بدأت مراقبة سعر $name</b>\n"
-        . price_card($buy, $sell)
-        . "\n🔔 سيصلك تنبيه عند تغيّر السعر {$cfg['threshold_percent']}% أو أكثر."
-        . footer($cfg);
+    $msg = compose(
+        $cfg,
+        "🤖 بدأت مراقبة سعر $name",
+        "سيصلك تنبيه عند تغيّر السعر {$cfg['threshold_percent']}% أو أكثر",
+        price_card($buy, $sell)
+    );
     if (send_telegram($cfg, $msg)) {
         $state['buy_ref'] = $buy;
         $state['sell_ref'] = $sell;
@@ -289,35 +372,38 @@ $sellMoved = abs($sellPct) >= $cfg['threshold_percent'];
 
 $cards = price_card($buy, $sell, $state['buy_ref'], $state['sell_ref']) . calc_card($cfg, $buy);
 
-$msg = null;
+$headline = null;
+$sub = '';
 $isAlert = false;
 
 if ($spike) {
     $up = $spike['pct'] > 0;
-    $msg = ($up ? "⚡️📈 <b>تحرك سريع — $name قفز</b>" : "⚡️📉 <b>تحرك سريع — $name هبط</b>")
-        . "\n<b>" . move_text($cfg, $buy, $spike['from']) . "</b> خلال {$spike['minutes']} دقيقة\n"
-        . $cards
-        . "\n⏰ <i>راجع أسعار متجرك الآن</i>"
-        . footer($cfg);
+    $headline = ($up ? "⚡️ قفزة سريعة: $name ارتفع إلى " : "⚡️ هبوط سريع: $name انخفض إلى ") . money($cfg, $buy);
+    $sub = change_text($cfg, $buy, $spike['from']) . ' خلال ' . minutes_text($spike['minutes'])
+        . "\n⏰ راجع أسعار متجرك الآن";
     $isAlert = true;
 } elseif ($buyMoved || $sellMoved) {
-    [$cur, $ref] = $buyMoved ? [$buy, $state['buy_ref']] : [$sell, $state['sell_ref']];
+    [$subject, $cur, $ref] = $buyMoved
+        ? [$name, $buy, $state['buy_ref']]
+        : ["سعر بيع $name", $sell, $state['sell_ref']];
     $up = $cur > $ref;
-    $msg = ($up ? "📈 <b>$name ارتفع</b>" : "📉 <b>$name انخفض</b>")
-        . "\n<b>" . move_text($cfg, $cur, $ref) . "</b>\n"
-        . $cards . footer($cfg);
+    $headline = ($up ? '🔺 ' : '🔻 ') . $subject . ($up ? ' ارتفع إلى ' : ' انخفض إلى ') . money($cfg, $cur);
+    $sub = change_text($cfg, $cur, $ref) . ' عن آخر تنبيه';
     $isAlert = true;
 } elseif ($cfg['update_minutes'] > 0 && $now - $state['last_post'] >= $cfg['update_minutes'] * 60) {
     // تحديث دوري: لا يغيّر السعر المرجعي، حتى لا يضيع التغيّر البطيء المتراكم
-    $drift = abs($buyPct) < 0.05
-        ? '▪️ مستقر منذ آخر تنبيه'
-        : move_text($cfg, $buy, $state['buy_ref']) . ' منذ آخر تنبيه';
-    $msg = "📊 <b>سعر $name الآن</b>\n$drift\n"
-        . price_card($buy, $sell) . calc_card($cfg, $buy) . footer($cfg);
+    $headline = "📊 $name الآن: " . money($cfg, $buy);
+    $sub = abs($buyPct) < 0.05
+        ? 'مستقر منذ آخر تنبيه'
+        : ($buy > $state['buy_ref'] ? 'أعلى' : 'أقل') . ' بـ ' . money($cfg, abs($buy - $state['buy_ref']))
+            . sprintf(' (%.2f%%)', abs($buyPct)) . ' من آخر تنبيه';
+    $cards = price_card($buy, $sell) . calc_card($cfg, $buy);
 }
 
 // لو فشل الإرسال لا نحدّث شيئاً، فتُعاد المحاولة في التشغيلة القادمة
-if ($msg !== null && send_telegram($cfg, $msg)) {
+if ($headline !== null
+    && send_telegram($cfg, compose($cfg, $headline, $sub, $cards), share_buttons($cfg, $headline, $buy, $sell))
+) {
     $state['last_post'] = $now;
     if ($isAlert) {
         $state['buy_ref'] = $buy;

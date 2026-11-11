@@ -26,4 +26,10 @@ return [
     // مبالغ الحاسبة بالدولار ([] = إخفاء الحاسبة)
     'calc_amounts' => [10, 50, 100],
     'timezone' => 'Africa/Khartoum',
+
+    // الأسماء الظاهرة في الرسائل
+    'asset_label' => 'الدولار',
+    'currency_label' => 'جنيه',
+    // توقيع القناة أسفل كل رسالة (null = يؤخذ من chat_id، '' = بدون توقيع)
+    'channel_tag' => null,
 ];

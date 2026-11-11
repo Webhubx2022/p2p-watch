@@ -21,7 +21,15 @@ $cfg += [
     // مبالغ الحاسبة بالدولار ([] = إخفاء الحاسبة)
     'calc_amounts' => [10, 50, 100],
     'timezone' => 'Africa/Khartoum',
+    // الأسماء الظاهرة في الرسائل
+    'asset_label' => 'الدولار',
+    'currency_label' => 'جنيه',
+    // توقيع القناة أسفل كل رسالة (null = يؤخذ من chat_id إذا كان @username، '' = بدون توقيع)
+    'channel_tag' => null,
 ];
+if ($cfg['channel_tag'] === null) {
+    $cfg['channel_tag'] = strpos((string)$cfg['chat_id'], '@') === 0 ? $cfg['chat_id'] : '';
+}
 date_default_timezone_set($cfg['timezone']);
 
 const BINANCE_URL = 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search';
@@ -134,27 +142,50 @@ function pct(float $cur, float $ref): float
     return ($cur - $ref) / $ref * 100;
 }
 
-function change_line(string $label, float $cur, float $ref, string $fiat): string
+/** 10774.00 → "10,774" و 10650.99 → "10,650.99" */
+function fmt(float $v): string
 {
-    $p = pct($cur, $ref);
-    $arrow = $p > 0 ? '🔺' : ($p < 0 ? '🔻' : '▪️');
-    return sprintf(
-        "%s %s: <b>%s</b> %s\n     كان %s (%+.2f%%)",
-        $arrow, $label, number_format($cur, 2), $fiat, number_format($ref, 2), $p
-    );
+    $s = number_format($v, 2);
+    return substr($s, -3) === '.00' ? substr($s, 0, -3) : $s;
+}
+
+/** "▲ 70 جنيه (0.65%)" */
+function move_text(array $cfg, float $cur, float $from): string
+{
+    $d = $cur - $from;
+    $arrow = $d > 0 ? '🔺' : ($d < 0 ? '🔻' : '▪️');
+    return sprintf('%s %s %s (%.2f%%)', $arrow, fmt(abs($d)), $cfg['currency_label'], abs(pct($cur, $from)));
+}
+
+/** بطاقة الأسعار؛ الرقم داخل <code> ليُنسخ بضغطة واحدة */
+function price_card(float $buy, float $sell, ?float $buyRef = null, ?float $sellRef = null): string
+{
+    $row = function (string $dot, string $label, float $cur, ?float $ref): string {
+        $line = "$dot <b>$label</b>   <code>" . fmt($cur) . '</code>';
+        if ($ref !== null) {
+            $line .= "\n       كان " . fmt($ref);
+        }
+        return $line;
+    };
+    return '<blockquote>' . $row('🟢', 'شراء', $buy, $buyRef) . "\n" . $row('🔴', 'بيع', $sell, $sellRef) . '</blockquote>';
 }
 
 /** حاسبة سريعة: كم يساوي 10$ و50$ و100$ بسعر الشراء الحالي */
-function calc_block(array $cfg, float $buy): string
+function calc_card(array $cfg, float $buy): string
 {
     if (!$cfg['calc_amounts']) {
         return '';
     }
-    $lines = ['🧮 <b>حاسبة سريعة</b>'];
+    $lines = ["🧮 <b>كم يساوي بال{$cfg['currency_label']}؟</b>"];
     foreach ($cfg['calc_amounts'] as $usd) {
-        $lines[] = "$usd$ = " . number_format($usd * $buy) . " {$cfg['fiat']}";
+        $lines[] = "$usd$ = " . number_format($usd * $buy) . " {$cfg['currency_label']}";
     }
-    return "\n\n" . implode("\n", $lines);
+    return "\n<blockquote>" . implode("\n", $lines) . '</blockquote>';
+}
+
+function footer(array $cfg): string
+{
+    return "\n🕒 " . date('H:i') . ($cfg['channel_tag'] !== '' ? "  •  {$cfg['channel_tag']}" : '');
 }
 
 // ---------- الحالة ----------
@@ -201,7 +232,7 @@ $state['failures'] = 0;
 $state['outage_reported'] = false;
 
 $fiat = $cfg['fiat'];
-$asset = $cfg['asset'];
+$name = $cfg['asset_label'];
 $now = time();
 
 echo 'Binance OK — شراء=' . number_format($buy, 2) . ' بيع=' . number_format($sell, 2)
@@ -220,10 +251,10 @@ if ($testMode) {
 
 // أول تشغيل: نثبت السعر المرجعي ونرسل رسالة بداية
 if ($state['buy_ref'] === null || $state['sell_ref'] === null) {
-    $msg = "🤖 <b>بدأت مراقبة $asset/$fiat</b>\n\n"
-        . '🟢 شراء: <b>' . number_format($buy, 2) . "</b> $fiat\n"
-        . '🔴 بيع: <b>' . number_format($sell, 2) . "</b> $fiat\n\n"
-        . "سيصلك تنبيه عند تغيّر السعر {$cfg['threshold_percent']}% أو أكثر.";
+    $msg = "🤖 <b>بدأت مراقبة سعر $name</b>\n"
+        . price_card($buy, $sell)
+        . "\n🔔 سيصلك تنبيه عند تغيّر السعر {$cfg['threshold_percent']}% أو أكثر."
+        . footer($cfg);
     if (send_telegram($cfg, $msg)) {
         $state['buy_ref'] = $buy;
         $state['sell_ref'] = $sell;
@@ -244,7 +275,7 @@ $spike = null;
 foreach ($state['history'] as [$ts, $price]) {
     $d = pct($buy, $price);
     if (abs($d) >= $cfg['spike_percent'] && ($spike === null || abs($d) > abs($spike['pct']))) {
-        $spike = ['pct' => $d, 'minutes' => max(1, (int)round(($now - $ts) / 60))];
+        $spike = ['pct' => $d, 'from' => $price, 'minutes' => max(1, (int)round(($now - $ts) / 60))];
     }
 }
 $state['history'][] = [$now, $buy];
@@ -256,30 +287,33 @@ $sellPct = pct($sell, $state['sell_ref']);
 $buyMoved = abs($buyPct) >= $cfg['threshold_percent'];
 $sellMoved = abs($sellPct) >= $cfg['threshold_percent'];
 
-$changes = change_line('شراء', $buy, $state['buy_ref'], $fiat) . "\n"
-    . change_line('بيع', $sell, $state['sell_ref'], $fiat);
+$cards = price_card($buy, $sell, $state['buy_ref'], $state['sell_ref']) . calc_card($cfg, $buy);
 
 $msg = null;
 $isAlert = false;
 
 if ($spike) {
     $up = $spike['pct'] > 0;
-    $msg = ($up ? "⚡️🚨📈 <b>ارتفاع سريع في سعر $asset</b>" : "⚡️🚨📉 <b>هبوط سريع في سعر $asset</b>")
-        . sprintf("\n%s <b>%.2f%%</b> خلال %d دقيقة", $up ? 'ارتفع' : 'انخفض', abs($spike['pct']), $spike['minutes'])
-        . "\n\n$changes" . calc_block($cfg, $buy);
+    $msg = ($up ? "⚡️📈 <b>تحرك سريع — $name قفز</b>" : "⚡️📉 <b>تحرك سريع — $name هبط</b>")
+        . "\n<b>" . move_text($cfg, $buy, $spike['from']) . "</b> خلال {$spike['minutes']} دقيقة\n"
+        . $cards
+        . "\n⏰ <i>راجع أسعار متجرك الآن</i>"
+        . footer($cfg);
     $isAlert = true;
 } elseif ($buyMoved || $sellMoved) {
-    $mainPct = $buyMoved ? $buyPct : $sellPct;
-    $msg = ($mainPct > 0 ? "🚨📈 <b>ارتفاع سعر $asset</b>" : "🚨📉 <b>انخفاض سعر $asset</b>")
-        . "\n\n$changes" . calc_block($cfg, $buy);
+    [$cur, $ref] = $buyMoved ? [$buy, $state['buy_ref']] : [$sell, $state['sell_ref']];
+    $up = $cur > $ref;
+    $msg = ($up ? "📈 <b>$name ارتفع</b>" : "📉 <b>$name انخفض</b>")
+        . "\n<b>" . move_text($cfg, $cur, $ref) . "</b>\n"
+        . $cards . footer($cfg);
     $isAlert = true;
 } elseif ($cfg['update_minutes'] > 0 && $now - $state['last_post'] >= $cfg['update_minutes'] * 60) {
     // تحديث دوري: لا يغيّر السعر المرجعي، حتى لا يضيع التغيّر البطيء المتراكم
-    $msg = "📊 <b>تحديث سعر $asset</b>\n\n"
-        . '🟢 شراء: <b>' . number_format($buy, 2) . "</b> $fiat\n"
-        . '🔴 بيع: <b>' . number_format($sell, 2) . "</b> $fiat"
-        . calc_block($cfg, $buy)
-        . "\n\n🕒 " . date('H:i');
+    $drift = abs($buyPct) < 0.05
+        ? '▪️ مستقر منذ آخر تنبيه'
+        : move_text($cfg, $buy, $state['buy_ref']) . ' منذ آخر تنبيه';
+    $msg = "📊 <b>سعر $name الآن</b>\n$drift\n"
+        . price_card($buy, $sell) . calc_card($cfg, $buy) . footer($cfg);
 }
 
 // لو فشل الإرسال لا نحدّث شيئاً، فتُعاد المحاولة في التشغيلة القادمة

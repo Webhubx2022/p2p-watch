@@ -74,8 +74,22 @@ struct Item {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Adv {
     price: String,
+    /// علامة الإعلان المروَّج في رد Binance
+    #[serde(default)]
+    privilege_type: Option<serde_json::Value>,
+    #[serde(default)]
+    privilege_desc: Option<serde_json::Value>,
+}
+
+fn is_set(v: &Option<serde_json::Value>) -> bool {
+    match v {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
+    }
 }
 
 #[derive(Deserialize)]
@@ -122,14 +136,22 @@ async fn fetch_price(http: &reqwest::Client, cfg: &Config, trade_type: &str) -> 
                 .unwrap_or(0.0)
                 >= cfg.min_orders
         })
+        .filter(|it| !is_set(&it.adv.privilege_type) && !is_set(&it.adv.privilege_desc))
         .filter_map(|it| it.adv.price.parse::<f64>().ok())
-        .take(cfg.top_n)
         .collect();
 
     if prices.is_empty() {
         return Err(format!("لا توجد إعلانات {trade_type} مطابقة").into());
     }
 
+    // نأخذ أفضل top_n سعر فعلياً (الأرخص للشراء، الأعلى للبيع) بدل أول top_n في القائمة،
+    // فالإعلان المروَّج الموضوع أعلى القائمة بسعر أسوأ يُستبعد حتى لو لم تكن عليه علامة.
+    if trade_type == "BUY" {
+        prices.sort_by(|a, b| a.total_cmp(b));
+    } else {
+        prices.sort_by(|a, b| b.total_cmp(a));
+    }
+    prices.truncate(cfg.top_n);
     prices.sort_by(|a, b| a.total_cmp(b));
     let mid = prices.len() / 2;
     Ok(if prices.len() % 2 == 1 {

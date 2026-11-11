@@ -78,17 +78,20 @@ function fetch_price(array $cfg, string $tradeType): float
     foreach ($resp['data'] ?? [] as $item) {
         $orders = (float)($item['advertiser']['monthOrderCount'] ?? 0);
         $price = (float)($item['adv']['price'] ?? 0);
-        if ($orders >= $cfg['min_orders'] && $price > 0) {
+        // الإعلان المروَّج يحمل علامة privilege في رد Binance
+        $promoted = !empty($item['adv']['privilegeType']) || !empty($item['adv']['privilegeDesc']);
+        if (!$promoted && $orders >= $cfg['min_orders'] && $price > 0) {
             $prices[] = $price;
-        }
-        if (count($prices) >= $cfg['top_n']) {
-            break;
         }
     }
     if (!$prices) {
         throw new RuntimeException("لا توجد إعلانات $tradeType مطابقة");
     }
 
+    // نأخذ أفضل top_n سعر فعلياً (الأرخص للشراء، الأعلى للبيع) بدل أول top_n في القائمة،
+    // فالإعلان المروَّج الموضوع أعلى القائمة بسعر أسوأ يُستبعد حتى لو لم تكن عليه علامة.
+    $tradeType === 'BUY' ? sort($prices) : rsort($prices);
+    $prices = array_slice($prices, 0, $cfg['top_n']);
     sort($prices);
     $n = count($prices);
     $mid = intdiv($n, 2);

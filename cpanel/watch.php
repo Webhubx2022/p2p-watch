@@ -18,8 +18,12 @@ const FAILURES_BEFORE_WARNING = 10;
 // منع تشغيل نسختين في نفس الوقت
 $lock = fopen(__DIR__ . '/watch.lock', 'c');
 if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
+    echo "نسخة أخرى من السكربت شغالة الآن، جرّب بعد ثوانٍ.\n";
     exit(0);
 }
+
+// php watch.php --test  → يرسل رسالة تجريبية للقناة ويطبع نتيجة كل خطوة
+$testMode = in_array('--test', $argv ?? [], true);
 
 function http_post_json(string $url, array $body): array
 {
@@ -158,6 +162,20 @@ $state['outage_reported'] = false;
 
 $fiat = $cfg['fiat'];
 $asset = $cfg['asset'];
+
+echo 'Binance OK — شراء=' . number_format($buy, 2) . ' بيع=' . number_format($sell, 2)
+    . ' | المرجع: شراء=' . ($state['buy_ref'] ?? '-') . ' بيع=' . ($state['sell_ref'] ?? '-') . "\n";
+
+if ($testMode) {
+    $ok = send_telegram(
+        $cfg,
+        "🧪 رسالة تجريبية\nشراء: " . number_format($buy, 2) . " $fiat\nبيع: " . number_format($sell, 2) . " $fiat"
+    );
+    echo $ok
+        ? "Telegram OK — وصلت الرسالة إلى {$cfg['chat_id']}\n"
+        : "Telegram FAILED — السبب في السطر أعلاه (chat_id الحالي: {$cfg['chat_id']})\n";
+    exit($ok ? 0 : 1);
+}
 
 // أول تشغيل: نثبت السعر المرجعي ونرسل رسالة بداية
 if ($state['buy_ref'] === null || $state['sell_ref'] === null) {

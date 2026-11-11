@@ -1,6 +1,6 @@
 <?php
 /**
- * نسخة cPanel من بوت مراقبة سعر USDT في Binance P2P.
+ * نسخة cPanel من بوت مراقبة سعر USDT.
  * تُشغَّل عن طريق Cron Job كل دقيقة: كل تشغيلة تفحص السعر مرة واحدة وتنتهي.
  */
 
@@ -10,6 +10,19 @@ if (PHP_SAPI !== 'cli') {
 }
 
 $cfg = require __DIR__ . '/config.php';
+
+// قيم افتراضية للإعدادات الجديدة، حتى يعمل config.php القديم بدون تعديل
+$cfg += [
+    // تحديث دوري بالسعر كل كم دقيقة إذا لم تُرسل أي رسالة (0 = إيقاف)
+    'update_minutes' => 60,
+    // تنبيه القفزة السريعة: تغيّر بهذه النسبة أو أكثر خلال هذه المدة
+    'spike_percent' => 2.0,
+    'spike_window_minutes' => 60,
+    // مبالغ الحاسبة بالدولار ([] = إخفاء الحاسبة)
+    'calc_amounts' => [10, 50, 100],
+    'timezone' => 'Africa/Khartoum',
+];
+date_default_timezone_set($cfg['timezone']);
 
 const BINANCE_URL = 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search';
 // عدد المحاولات الفاشلة المتتالية قبل تحذير القناة
@@ -25,33 +38,35 @@ if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
 // php watch.php --test  → يرسل رسالة تجريبية للقناة ويطبع نتيجة كل خطوة
 $testMode = in_array('--test', $argv ?? [], true);
 
-function http_post_json(string $url, array $body): array
-{
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => json_encode($body),
-        CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-        CURLOPT_USERAGENT => 'Mozilla/5.0 (X11; Linux x86_64) p2p-watch/0.1',
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 20,
-    ]);
-    $raw = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $err = curl_error($ch);
-    curl_close($ch);
+if (!function_exists('http_post_json')) {
+    function http_post_json(string $url, array $body): array
+    {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode($body),
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_USERAGENT => 'Mozilla/5.0 (X11; Linux x86_64) p2p-watch/0.1',
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 20,
+        ]);
+        $raw = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err = curl_error($ch);
+        curl_close($ch);
 
-    if ($raw === false) {
-        throw new RuntimeException("اتصال فاشل: $err");
+        if ($raw === false) {
+            throw new RuntimeException("اتصال فاشل: $err");
+        }
+        if ($code < 200 || $code >= 300) {
+            throw new RuntimeException("HTTP $code: " . substr($raw, 0, 200));
+        }
+        $data = json_decode($raw, true);
+        if (!is_array($data)) {
+            throw new RuntimeException('رد غير مفهوم');
+        }
+        return $data;
     }
-    if ($code < 200 || $code >= 300) {
-        throw new RuntimeException("HTTP $code: " . substr($raw, 0, 200));
-    }
-    $data = json_decode($raw, true);
-    if (!is_array($data)) {
-        throw new RuntimeException('رد غير مفهوم');
-    }
-    return $data;
 }
 
 /**
@@ -129,11 +144,33 @@ function change_line(string $label, float $cur, float $ref, string $fiat): strin
     );
 }
 
+/** حاسبة سريعة: كم يساوي 10$ و50$ و100$ بسعر الشراء الحالي */
+function calc_block(array $cfg, float $buy): string
+{
+    if (!$cfg['calc_amounts']) {
+        return '';
+    }
+    $lines = ['🧮 <b>حاسبة سريعة</b>'];
+    foreach ($cfg['calc_amounts'] as $usd) {
+        $lines[] = "$usd$ = " . number_format($usd * $buy) . " {$cfg['fiat']}";
+    }
+    return "\n\n" . implode("\n", $lines);
+}
+
 // ---------- الحالة ----------
 
 $stateFile = __DIR__ . '/state.json';
 $state = (is_file($stateFile) ? json_decode(file_get_contents($stateFile), true) : null) ?: [];
-$state += ['buy_ref' => null, 'sell_ref' => null, 'failures' => 0, 'outage_reported' => false];
+$state += [
+    'buy_ref' => null,
+    'sell_ref' => null,
+    'failures' => 0,
+    'outage_reported' => false,
+    // وقت آخر رسالة أُرسلت للقناة
+    'last_post' => 0,
+    // أسعار الشراء خلال نافذة القفزة السريعة: [[وقت, سعر], ...]
+    'history' => [],
+];
 
 $save = function () use (&$state, $stateFile) {
     file_put_contents($stateFile, json_encode($state), LOCK_EX);
@@ -150,7 +187,7 @@ try {
     if ($state['failures'] >= FAILURES_BEFORE_WARNING && !$state['outage_reported']) {
         $state['outage_reported'] = send_telegram(
             $cfg,
-            '⚠️ <b>تنبيه:</b> البوت غير قادر على قراءة أسعار Binance P2P حالياً. راقب السعر يدوياً حتى تعود الخدمة.'
+            '⚠️ <b>تنبيه:</b> تعذّر تحديث الأسعار حالياً. راقب السعر يدوياً حتى تعود الخدمة.'
         );
     }
     $save();
@@ -165,6 +202,7 @@ $state['outage_reported'] = false;
 
 $fiat = $cfg['fiat'];
 $asset = $cfg['asset'];
+$now = time();
 
 echo 'Binance OK — شراء=' . number_format($buy, 2) . ' بيع=' . number_format($sell, 2)
     . ' | المرجع: شراء=' . ($state['buy_ref'] ?? '-') . ' بيع=' . ($state['sell_ref'] ?? '-') . "\n";
@@ -189,28 +227,71 @@ if ($state['buy_ref'] === null || $state['sell_ref'] === null) {
     if (send_telegram($cfg, $msg)) {
         $state['buy_ref'] = $buy;
         $state['sell_ref'] = $sell;
+        $state['last_post'] = $now;
+        $state['history'] = [[$now, $buy]];
     }
     $save();
     exit(0);
 }
+
+// ---------- القفزة السريعة ----------
+// نقارن سعر الشراء الحالي بكل سعر مسجّل داخل النافذة الزمنية ونأخذ أكبر فرق
+
+$cut = $now - $cfg['spike_window_minutes'] * 60;
+$state['history'] = array_values(array_filter($state['history'], fn($h) => $h[0] >= $cut));
+
+$spike = null;
+foreach ($state['history'] as [$ts, $price]) {
+    $d = pct($buy, $price);
+    if (abs($d) >= $cfg['spike_percent'] && ($spike === null || abs($d) > abs($spike['pct']))) {
+        $spike = ['pct' => $d, 'minutes' => max(1, (int)round(($now - $ts) / 60))];
+    }
+}
+$state['history'][] = [$now, $buy];
+
+// ---------- التنبيهات ----------
 
 $buyPct = pct($buy, $state['buy_ref']);
 $sellPct = pct($sell, $state['sell_ref']);
 $buyMoved = abs($buyPct) >= $cfg['threshold_percent'];
 $sellMoved = abs($sellPct) >= $cfg['threshold_percent'];
 
-if ($buyMoved || $sellMoved) {
-    $mainPct = $buyMoved ? $buyPct : $sellPct;
-    $title = $mainPct > 0 ? "🚨📈 <b>ارتفاع سعر $asset</b>" : "🚨📉 <b>انخفاض سعر $asset</b>";
-    $msg = "$title\n\n"
-        . change_line('شراء', $buy, $state['buy_ref'], $fiat) . "\n"
-        . change_line('بيع', $sell, $state['sell_ref'], $fiat) . "\n\n"
-        . "<i>Binance P2P — $fiat</i>";
+$changes = change_line('شراء', $buy, $state['buy_ref'], $fiat) . "\n"
+    . change_line('بيع', $sell, $state['sell_ref'], $fiat);
 
-    // لو فشل الإرسال لا نحدّث المرجع، فيعاد التنبيه في التشغيلة القادمة
-    if (send_telegram($cfg, $msg)) {
+$msg = null;
+$isAlert = false;
+
+if ($spike) {
+    $up = $spike['pct'] > 0;
+    $msg = ($up ? "⚡️🚨📈 <b>ارتفاع سريع في سعر $asset</b>" : "⚡️🚨📉 <b>هبوط سريع في سعر $asset</b>")
+        . sprintf("\n%s <b>%.2f%%</b> خلال %d دقيقة", $up ? 'ارتفع' : 'انخفض', abs($spike['pct']), $spike['minutes'])
+        . "\n\n$changes" . calc_block($cfg, $buy);
+    $isAlert = true;
+} elseif ($buyMoved || $sellMoved) {
+    $mainPct = $buyMoved ? $buyPct : $sellPct;
+    $msg = ($mainPct > 0 ? "🚨📈 <b>ارتفاع سعر $asset</b>" : "🚨📉 <b>انخفاض سعر $asset</b>")
+        . "\n\n$changes" . calc_block($cfg, $buy);
+    $isAlert = true;
+} elseif ($cfg['update_minutes'] > 0 && $now - $state['last_post'] >= $cfg['update_minutes'] * 60) {
+    // تحديث دوري: لا يغيّر السعر المرجعي، حتى لا يضيع التغيّر البطيء المتراكم
+    $msg = "📊 <b>تحديث سعر $asset</b>\n\n"
+        . '🟢 شراء: <b>' . number_format($buy, 2) . "</b> $fiat\n"
+        . '🔴 بيع: <b>' . number_format($sell, 2) . "</b> $fiat"
+        . calc_block($cfg, $buy)
+        . "\n\n🕒 " . date('H:i');
+}
+
+// لو فشل الإرسال لا نحدّث شيئاً، فتُعاد المحاولة في التشغيلة القادمة
+if ($msg !== null && send_telegram($cfg, $msg)) {
+    $state['last_post'] = $now;
+    if ($isAlert) {
         $state['buy_ref'] = $buy;
         $state['sell_ref'] = $sell;
+    }
+    if ($spike) {
+        // نبدأ نافذة جديدة حتى لا يتكرر تنبيه القفزة كل دقيقة
+        $state['history'] = [[$now, $buy]];
     }
 }
 
